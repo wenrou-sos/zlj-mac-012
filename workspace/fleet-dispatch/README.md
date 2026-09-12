@@ -99,6 +99,11 @@ DATABASE_URL=postgres://user:pass@host:5432/fleet_dispatch
 
 ## 异常处理
 
+- **撤销派车**：仅 **待装车（planned）** 车次可撤销。撤销后车次保留为 `cancelled`
+  审计留痕，运片标记 `released`（不计运量），车辆/司机在**确认无其他活跃车次后**
+  才释放为可用/空闲，订单运量退回待调度可重新派车。已装车/在途车次拒绝撤销并给出
+  明确提示，需先走装车→发车→签收流程。同一次「一键智能调度」的车次共享
+  `dispatch_batch` 批次号，支持在车次页按批次筛选并**整批撤销**（已开始作业的车次自动跳过）。
 - **车辆故障**（车次页/车辆页上报）：车辆置 `broken_down`，系统自动寻找
   **同车型、容量足够的空闲车** 转运货物，原司机继续值乘，自动叠加 45/90 分钟延误；
   无替换车时车次挂起等待救援。修复后一键「修复完工」恢复可用。
@@ -117,6 +122,9 @@ DATABASE_URL=postgres://user:pass@host:5432/fleet_dispatch
 | POST | `/api/trips/:id/start-loading` | 开始装车 |
 | POST | `/api/trips/:id/loading` | 装车进度上报（地磅吨数） |
 | POST | `/api/trips/:id/depart` `/complete` | 发车 / 签收 |
+| POST | `/api/trips/:id/cancel` | 撤销单个未开始车次（幂等拒绝重复撤销） |
+| POST | `/api/batches/:batch/cancel` | 整批撤销未开始车次（已开始的跳过） |
+| GET | `/api/batches` | 调度批次汇总 |
 | POST | `/api/incidents/breakdown` `/delay` | 故障 / 延误 |
 | POST | `/api/vehicles/:id/repair` | 车辆修复复工 |
 

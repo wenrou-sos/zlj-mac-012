@@ -90,6 +90,14 @@ function genTripNo() {
   return `TR${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}${seq}${Math.floor(Math.random() * 90 + 10)}`;
 }
 
+let batchSeq = 0;
+/** 一次「一键智能调度」的批次号，同批车次共享 */
+function genBatchNo() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `DB${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}${String(++batchSeq).padStart(3, '0')}`;
+}
+
 // ---------------------------------------------------------------------------
 // 自动调度：两阶段（严格车型 → 兼容兜底）+ FFD/best-fit 装箱
 // ---------------------------------------------------------------------------
@@ -111,8 +119,8 @@ export async function autoDispatch() {
     for (const o of orders) {
       const { rows: assigned } = await client.query(
         `SELECT COALESCE(SUM(weight_tons),0) AS w, COALESCE(SUM(volume_m3),0) AS v
-         FROM trip_items ti JOIN trips t ON t.id = ti.trip_id
-         WHERE ti.order_id = $1 AND t.status <> 'cancelled'`, [o.id]);
+       FROM trip_items ti JOIN trips t ON t.id = ti.trip_id
+        WHERE ti.order_id = $1 AND t.status <> 'cancelled' AND ti.load_status<>'released'`, [o.id]);
       const remainW = Number(o.weight_tons) - Number(assigned[0].w);
       const remainV = Number(o.volume_m3) - Number(assigned[0].v);
       if (remainW > 0.001 || remainV > 0.001) items.push({ order: o, remainW, remainV });
@@ -281,14 +289,16 @@ export async function autoDispatch() {
 
     // ---- 落库阶段 ----
     let tripsCreated = 0;
+    const batchNo = planned.length ? genBatchNo() : null;
     for (const t of planned) {
       const totalW = t.loads.reduce((s, l) => s + l.w, 0);
       const { depart, arrive } = planArrival(start, totalW, t.distance);
       const { rows: tr } = await client.query(
         `INSERT INTO trips (trip_no, vehicle_id, driver_id, origin, destination, distance_km,
-                            status, planned_depart, planned_arrive)
-         VALUES ($1,$2,$3,$4,$5,$6,'planned',$7,$8) RETURNING id`,
-        [genTripNo(), t.vehicle.id, t.driver.id, t.origin, t.destination, t.distance, depart, arrive]);
+                            status, dispatch_batch, planned_depart, planned_arrive)
+         VALUES ($1,$2,$3,$4,$5,$6,'planned',$7,$8,$9) RETURNING id`,
+        [genTripNo(), t.vehicle.id, t.driver.id, t.origin, t.destination, t.distance,
+         batchNo, depart, arrive]);
       const tripId = tr[0].id;
       for (const l of t.loads) {
         await client.query(
@@ -340,7 +350,7 @@ export async function autoDispatch() {
     }
 
     await client.query('COMMIT');
-    return { tripsCreated, ordersAssigned, ordersSplit, unmet };
+    return { tripsCreated, ordersAssigned, ordersSplit, unmet, batchNo };
   } catch (e) {
     await client.query('ROLLBACK');
     throw e;
@@ -379,7 +389,7 @@ export async function assignOrder(orderId, vehicleId, driverId, splitTons = null
     const { rows: sum } = await client.query(
       `SELECT COALESCE(SUM(weight_tons),0) w, COALESCE(SUM(volume_m3),0) v
        FROM trip_items ti JOIN trips t ON t.id=ti.trip_id
-       WHERE ti.order_id=$1 AND t.status<>'cancelled'`, [orderId]);
+       WHERE ti.order_id=$1 AND t.status<>'cancelled' AND ti.load_status<>'released'`, [orderId]);
     const remainW = Number(order.weight_tons) - Number(sum[0].w);
     const remainV = Number(order.volume_m3) - Number(sum[0].v);
     const chunkW = splitTons ? Math.min(Number(splitTons), remainW) : remainW;
@@ -584,6 +594,176 @@ export async function completeTrip(tripId) {
   } catch (e) {
     await client.query('ROLLBACK'); throw e;
   } finally { client.release(); }
+}
+
+// ---------------------------------------------------------------------------
+// 撤销派车（仅限未开始装车的 planned 车次）
+// ---------------------------------------------------------------------------
+
+const TRIP_STATUS_LABEL = {
+  planned: '待装车', loading: '装车中', in_transit: '运输中',
+  completed: '已完成', cancelled: '已撤销',
+};
+
+/** 车辆若无任何活跃车次引用，则回到 available（故障/维保状态不动） */
+async function releaseVehicleIfFree(client, vehicleId) {
+  if (!vehicleId) return;
+  const { rows } = await client.query(
+    `SELECT v.status,
+            (SELECT COUNT(*) FROM trips t
+              WHERE t.vehicle_id = v.id
+                AND t.status IN ('planned','loading','in_transit'))::int AS active
+     FROM vehicles v
+     WHERE v.id = $1 FOR UPDATE`, [vehicleId]);
+  if (!rows.length) return;
+  if (Number(rows[0].active) === 0
+      && ['assigned', 'loading', 'in_transit'].includes(rows[0].status)) {
+    await client.query(`UPDATE vehicles SET status='available' WHERE id=$1`, [vehicleId]);
+  }
+}
+
+/** 司机若无任何活跃车次值乘，则回到 available */
+async function releaseDriverIfFree(client, driverId) {
+  if (!driverId) return;
+  const { rows } = await client.query(
+    `SELECT d.status,
+            (SELECT COUNT(*) FROM trips t
+              WHERE t.driver_id = d.id
+                AND t.status IN ('planned','loading','in_transit'))::int AS active
+     FROM drivers d
+     WHERE d.id = $1 FOR UPDATE`, [driverId]);
+  if (!rows.length) return;
+  if (Number(rows[0].active) === 0 && rows[0].status === 'on_trip') {
+    await client.query(`UPDATE drivers SET status='available' WHERE id=$1`, [driverId]);
+  }
+}
+
+/**
+ * 按当前运片重新计算非终态订单状态：
+ * - 仍有活跃运片（planned/loading/in_transit）：保持原状不动
+ * - 无活跃运片但有已签收运片：split（部分签收，剩余回到待调度）
+ * - 两者都没有：pending（运量全部回到待调度，可重新派车）
+ */
+async function recomputeOrderStatus(client, orderId) {
+  const { rows: ors } = await client.query(
+    `SELECT status FROM orders WHERE id=$1 FOR UPDATE`, [orderId]);
+  if (!ors.length) return;
+  if (['delivered', 'cancelled'].includes(ors[0].status)) return;
+
+  const { rows: agg } = await client.query(
+    `SELECT
+       COALESCE(SUM(ti.weight_tons) FILTER (WHERE t.status IN ('planned','loading','in_transit')),0) active_w,
+       COALESCE(SUM(ti.weight_tons) FILTER (WHERE t.status='completed'),0) done_w
+     FROM trip_items ti JOIN trips t ON t.id=ti.trip_id
+     WHERE ti.order_id=$1`, [orderId]);
+  const activeW = Number(agg[0].active_w);
+  const doneW = Number(agg[0].done_w);
+  let next = null;
+  if (activeW <= 1e-6) next = doneW > 1e-6 ? 'split' : 'pending';
+  if (next) await client.query(`UPDATE orders SET status=$1 WHERE id=$2`, [next, orderId]);
+}
+
+/** 撤销单个车次的事务内核（供单车撤销与整批撤销复用） */
+async function cancelTripTx(client, tripId) {
+  const { rows: tr } = await client.query(
+    `SELECT * FROM trips WHERE id=$1 FOR UPDATE`, [tripId]);
+  const trip = tr[0];
+  if (!trip) throw Object.assign(new Error('车次不存在'), { status: 404 });
+
+  if (trip.status === 'cancelled') {
+    throw Object.assign(
+      new Error(`车次 ${trip.trip_no} 此前已被撤销，请勿重复操作`), { status: 409, code: 'ALREADY_CANCELLED' });
+  }
+  if (trip.status !== 'planned') {
+    const hint = trip.status === 'loading' ? '请先完成或中止装车流程'
+      : trip.status === 'in_transit' ? '请在车次签收后按异常流程处理'
+      : '该车次已完结';
+    throw Object.assign(
+      new Error(`车次 ${trip.trip_no} 当前为「${TRIP_STATUS_LABEL[trip.status]}」，已开始作业不能撤销，${hint}`),
+      { status: 409, code: 'TRIP_ACTIVE' });
+  }
+
+  const { rows: itemRows } = await client.query(
+    `SELECT DISTINCT order_id FROM trip_items WHERE trip_id=$1 AND load_status<>'released'`,
+    [tripId]);
+  const orderIds = itemRows.map(r => r.order_id);
+
+  // 运片保留为 released 快照（便于审计与订单详情回溯），但不再计入任何运量；
+  // 车次本身置 cancelled。运量由此回到订单的待调度池。
+  await client.query(
+    `UPDATE trip_items SET load_status='released' WHERE trip_id=$1 AND load_status<>'released'`,
+    [tripId]);
+  await client.query(
+    `UPDATE trips SET status='cancelled' WHERE id=$1`, [tripId]);
+
+  // 资源仅在确实无其他活跃车次时才释放，避免把正在执行任务的资源状态改坏
+  await releaseVehicleIfFree(client, trip.vehicle_id);
+  await releaseDriverIfFree(client, trip.driver_id);
+  for (const oid of orderIds) await recomputeOrderStatus(client, oid);
+
+  return {
+    tripId, tripNo: trip.trip_no, batch: trip.dispatch_batch,
+    vehicleId: trip.vehicle_id, driverId: trip.driver_id, orderIds,
+  };
+}
+
+/** 撤销单个未开始车次 */
+export async function cancelTrip(tripId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await cancelTripTx(client, tripId);
+    await client.query('COMMIT');
+    return r;
+  } catch (e) {
+    await client.query('ROLLBACK'); throw e;
+  } finally { client.release(); }
+}
+
+/**
+ * 撤销同一调度批次内所有「未开始」车次；已开始的车次跳过并在结果中列出。
+ * 同一次「一键智能调度」批量建立的车次 dispatch_batch 相同。
+ */
+export async function cancelBatch(batchNo) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: trips } = await client.query(
+      `SELECT id, trip_no, status FROM trips WHERE dispatch_batch=$1 ORDER BY id FOR UPDATE`,
+      [batchNo]);
+    if (!trips.length) {
+      throw Object.assign(new Error(`调度批次 ${batchNo} 不存在`), { status: 404 });
+    }
+    const cancelled = [];
+    const skipped = [];
+    for (const t of trips) {
+      try {
+        cancelled.push(await cancelTripTx(client, t.id));
+      } catch (e) {
+        if (e.status === 409) skipped.push({ tripId: t.id, tripNo: t.trip_no, reason: e.message });
+        else throw e;
+      }
+    }
+    await client.query('COMMIT');
+    return { batch: batchNo, total: trips.length, cancelled, skipped };
+  } catch (e) {
+    await client.query('ROLLBACK'); throw e;
+  } finally { client.release(); }
+}
+
+/** 批次汇总（车次列表/筛选使用） */
+export async function listBatches() {
+  const { rows } = await pool.query(
+    `SELECT dispatch_batch AS batch,
+            COUNT(*)::int total,
+            COUNT(*) FILTER (WHERE status='planned')::int planned,
+            COUNT(*) FILTER (WHERE status IN ('loading','in_transit'))::int active,
+            COUNT(*) FILTER (WHERE status='completed')::int completed,
+            COUNT(*) FILTER (WHERE status='cancelled')::int cancelled,
+            MIN(created_at) created_at
+     FROM trips WHERE dispatch_batch IS NOT NULL
+     GROUP BY dispatch_batch ORDER BY MIN(created_at) DESC`);
+  return rows;
 }
 
 // ---------------------------------------------------------------------------

@@ -57,8 +57,11 @@
         <template #default="{ row }">
           <el-space wrap size="small">
             <el-tag v-for="(ref, i) in row.trip_refs || []" :key="i" size="small"
-              :type="TRIP_STATUS[ref.status]?.type" effect="plain">
-              {{ ref.trip_no }} · {{ ref.weight_tons }}t · {{ LOAD_STATUS[ref.load_status]?.label }}
+              :type="ref.load_status==='released' ? 'info' : TRIP_STATUS[ref.status]?.type"
+              :effect="ref.load_status==='released' ? 'plain' : 'dark'"
+              :style="ref.load_status==='released' ? 'text-decoration:line-through' : ''">
+              {{ ref.trip_no }} · {{ ref.weight_tons }}t ·
+              {{ ref.load_status==='released' ? '已撤销退回' : LOAD_STATUS[ref.load_status]?.label }}
             </el-tag>
           </el-space>
         </template>

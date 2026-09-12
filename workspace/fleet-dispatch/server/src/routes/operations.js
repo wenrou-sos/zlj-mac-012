@@ -3,6 +3,7 @@ import { pool } from '../db/pool.js';
 import {
   autoDispatch, assignOrder, startLoading, reportLoading, departTrip, completeTrip,
   reportBreakdown, repairVehicle, reportDelay, dashboardStats,
+  cancelTrip, cancelBatch, listBatches,
 } from '../services/dispatch.js';
 
 const r = Router();
@@ -88,6 +89,26 @@ r.post('/trips/:id/depart', async (req, res, next) => {
 
 r.post('/trips/:id/complete', async (req, res, next) => {
   try { await completeTrip(req.params.id); res.json({ ok: true }); }
+  catch (e) { next(e); }
+});
+
+// ---------------- 撤销派车 ----------------
+r.post('/trips/:id/cancel', async (req, res, next) => {
+  try {
+    const result = await cancelTrip(req.params.id);
+    res.json(result);
+  } catch (e) { next(e); }
+});
+
+r.post('/batches/:batch/cancel', async (req, res, next) => {
+  try {
+    const result = await cancelBatch(req.params.batch);
+    res.json(result);
+  } catch (e) { next(e); }
+});
+
+r.get('/batches', async (req, res, next) => {
+  try { res.json(await listBatches()); }
   catch (e) { next(e); }
 });
 

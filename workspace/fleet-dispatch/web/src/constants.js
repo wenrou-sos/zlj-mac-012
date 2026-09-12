@@ -44,6 +44,7 @@ export const LOAD_STATUS = {
   waiting: { label: '待装', type: 'info' },
   loading: { label: '装载中', type: 'warning' },
   loaded: { label: '已装完', type: 'success' },
+  released: { label: '已撤销', type: 'info' },
 };
 
 export function tag(map, key) {

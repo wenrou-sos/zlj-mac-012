@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS trips (
   distance_km     NUMERIC(6,1) NOT NULL,
   status          VARCHAR(20) NOT NULL DEFAULT 'planned'
                     CHECK (status IN ('planned','loading','in_transit','completed','cancelled')),
+  dispatch_batch  VARCHAR(40), -- 同一次「一键智能调度」批量建立的车次共享同一批次号；手动派车为 NULL
   planned_depart  TIMESTAMPTZ,
   actual_depart   TIMESTAMPTZ,
   planned_arrive  TIMESTAMPTZ,
@@ -74,7 +75,8 @@ CREATE TABLE IF NOT EXISTS trip_items (
   volume_m3     NUMERIC(8,2) NOT NULL,
   loaded_tons   NUMERIC(8,2) DEFAULT 0,
   load_status   VARCHAR(20) NOT NULL DEFAULT 'waiting'
-                  CHECK (load_status IN ('waiting','loading','loaded')),
+                  CONSTRAINT ck_trip_items_load_status
+                  CHECK (load_status IN ('waiting','loading','loaded','released')),
   UNIQUE (trip_id, order_id)
 );
 CREATE INDEX IF NOT EXISTS idx_trip_items_order ON trip_items(order_id);

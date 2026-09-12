@@ -34,6 +34,9 @@ export default {
   reportLoading: (id, data) => api.post(`/trips/${id}/loading`, data),
   depart: (id) => api.post(`/trips/${id}/depart`),
   complete: (id) => api.post(`/trips/${id}/complete`),
+  cancelTrip: (id) => api.post(`/trips/${id}/cancel`),
+  cancelBatch: (batch) => api.post(`/batches/${batch}/cancel`),
+  getBatches: () => api.get('/batches'),
   // 异常
   reportBreakdown: (data) => api.post('/incidents/breakdown', data),
   reportDelay: (data) => api.post('/incidents/delay', data),
