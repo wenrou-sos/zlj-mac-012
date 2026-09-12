@@ -56,6 +56,32 @@ function planArrival(start, totalTons, distanceKm, delayMin = 0) {
   return { depart, arrive: addMinutes(depart, travelMinutes(distanceKm) + delayMin) };
 }
 
+/**
+ * 车次的「预计到达时间」唯一口径（ETA 已包含全部累计延误，任何地方都不要再
+ * 额外叠加 delay_minutes，否则会重复计入、提前触发逾期）：
+ * - 未发车：以当前时刻 + 剩余装车时间 + 行驶时间 + 累计延误 估算
+ * - 已发车：实际发车时间 + 行驶时间 + 累计延误
+ */
+async function recalcTripEta(client, tripId, extraDelayMin = 0) {
+  const { rows: tr } = await client.query(
+    `SELECT t.*, COALESCE((SELECT SUM(weight_tons) FROM trip_items WHERE trip_id=t.id),0) load_w
+     FROM trips t WHERE t.id=$1 FOR UPDATE`, [tripId]);
+  const t = tr[0];
+  if (!t) return null;
+  const delay = Number(t.delay_minutes || 0) + Number(extraDelayMin || 0);
+  let eta;
+  if (t.actual_depart) {
+    eta = addMinutes(new Date(t.actual_depart), travelMinutes(Number(t.distance_km)) + delay);
+  } else {
+    const { arrive } = planArrival(now(), Number(t.load_w), Number(t.distance_km), delay);
+    eta = arrive;
+  }
+  await client.query(
+    `UPDATE trips SET delay_minutes=$1, planned_arrive=$2 WHERE id=$3`,
+    [delay, eta, tripId]);
+  return eta;
+}
+
 let tripSeq = 0;
 function genTripNo() {
   const d = new Date();
@@ -497,8 +523,11 @@ export async function departTrip(tripId) {
     if (Number(pending[0].c) > 0) throw Object.assign(new Error('仍有货物未装完，不能发车'), { status: 409 });
 
     const ts = now();
+    // 以实际发车时刻重锚预计到达：途中 ETA = 实发 + 行驶时间 + 此前累计延误
+    const eta = addMinutes(ts, travelMinutes(Number(trip.distance_km)) + Number(trip.delay_minutes || 0));
     await client.query(
-      `UPDATE trips SET status='in_transit', actual_depart=$1 WHERE id=$2`, [ts, tripId]);
+      `UPDATE trips SET status='in_transit', actual_depart=$1, planned_arrive=$2 WHERE id=$3`,
+      [ts, eta, tripId]);
     await client.query(`UPDATE vehicles SET status='in_transit' WHERE id=$1`, [trip.vehicle_id]);
     await client.query(
       `UPDATE orders SET status='in_transit' WHERE id IN (SELECT order_id FROM trip_items WHERE trip_id=$1)`, [tripId]);
@@ -530,19 +559,26 @@ export async function completeTrip(tripId) {
     const { rows: items } = await client.query(
       `SELECT DISTINCT order_id FROM trip_items WHERE trip_id=$1`, [tripId]);
     for (const { order_id } of items) {
+      // 必须按「运量」判定完结：拆分订单可能还有运片尚未派车，
+      // 那些运片不在 trip_items 中，按运片数比较会把部分签收误判为整单完成。
       const { rows: oall } = await client.query(
-        `SELECT o.id, o.deadline,
-          (SELECT COUNT(*) FROM trip_items ti JOIN trips t ON t.id=ti.trip_id
-           WHERE ti.order_id=o.id AND t.status<>'cancelled') total,
-          (SELECT COUNT(*) FROM trip_items ti JOIN trips t ON t.id=ti.trip_id
-           WHERE ti.order_id=o.id AND t.status='completed') done
+        `SELECT o.id, o.deadline, o.weight_tons, o.volume_m3,
+          COALESCE((
+            SELECT SUM(ti.weight_tons) FROM trip_items ti JOIN trips t ON t.id=ti.trip_id
+            WHERE ti.order_id=o.id AND t.status='completed'),0) done_w,
+          COALESCE((
+            SELECT SUM(ti.volume_m3) FROM trip_items ti JOIN trips t ON t.id=ti.trip_id
+            WHERE ti.order_id=o.id AND t.status='completed'),0) done_v
          FROM orders o WHERE o.id=$1 FOR UPDATE`, [order_id]);
       const o = oall[0];
-      if (Number(o.total) === Number(o.done)) {
+      const allDelivered = Number(o.done_w) + 1e-6 >= Number(o.weight_tons)
+        && Number(o.done_v) + 1e-6 >= Number(o.volume_m3);
+      if (allDelivered) {
         const late = arrival > new Date(o.deadline);
         await client.query(`UPDATE orders SET status=$1 WHERE id=$2`,
           [late ? 'late' : 'delivered', order_id]);
       }
+      // 未全部签收（含尚未派车的剩余运量）：保持流转中状态，不标记完成
     }
     await client.query('COMMIT');
   } catch (e) {
@@ -593,14 +629,17 @@ export async function reportBreakdown(vehicleId, description, severity = 'medium
 
       if (alts.length) {
         const replacement = alts[0];
+        const transferDelay = severity === 'high' ? 90 : 45;
         await client.query(`UPDATE trips SET vehicle_id=$1, delay_minutes=delay_minutes+$2,
                             delay_reason=COALESCE(delay_reason,'')||$3 WHERE id=$4`,
-          [replacement.id, severity === 'high' ? 90 : 45,
+          [replacement.id, transferDelay,
            `\n[故障转运] ${vehicle.plate} -> ${replacement.plate}（${description || '车辆故障'}）`, trip.id]);
         await client.query(`UPDATE vehicles SET status =
                               CASE WHEN $1 = 'planned' THEN 'assigned' ELSE $1 END
                             WHERE id=$2`,
           [trip.status, replacement.id]);
+        // 统一重算 ETA（内部已含累计延误），再据此判断逾期
+        await recalcTripEta(client, trip.id);
         const lateOrders = await flagLateIfNeeded(client, trip.id);
         reassignedTo = replacement;
         await client.query(
@@ -611,6 +650,7 @@ export async function reportBreakdown(vehicleId, description, severity = 'medium
           `UPDATE trips SET delay_minutes=delay_minutes+$1,
             delay_reason=COALESCE(delay_reason,'')||$2 WHERE id=$3`,
           [severity === 'high' ? 180 : 90, `\n[故障待援] ${description || '车辆故障'}`, trip.id]);
+        await recalcTripEta(client, trip.id);
         await flagLateIfNeeded(client, trip.id);
       }
     }
@@ -652,12 +692,13 @@ export async function reportDelay(tripId, delayMinutes, reason) {
     }
 
     const m = Math.max(1, Number(delayMinutes) || 0);
-    const totalDelay = Number(trip.delay_minutes) + m;
+    const totalDelay = Number(trip.delay_minutes || 0) + m;
     await client.query(
       `UPDATE trips SET delay_minutes = $1,
-         planned_arrive = COALESCE(planned_arrive, now()) + ($2 || ' minutes')::interval,
-         delay_reason = COALESCE(delay_reason,'') || $3 WHERE id=$4`,
-      [totalDelay, m, `\n[延误] ${reason || '路况异常'} (+${m}分钟)`, tripId]);
+         delay_reason = COALESCE(delay_reason,'') || $2 WHERE id=$3`,
+      [totalDelay, `\n[延误] ${reason || '路况异常'} (+${m}分钟)`, tripId]);
+    // ETA 由统一口径重算（内部已含全部累计延误，避免重复计入）
+    await recalcTripEta(client, tripId);
     await client.query(
       `INSERT INTO incidents (trip_id, vehicle_id, type, severity, description, delay_minutes, resolution)
        VALUES ($1,$2,'delay',CASE WHEN $3>=120 THEN 'high' WHEN $3>=60 THEN 'medium' ELSE 'low' END,$4,$3,'delayed')`,
@@ -671,15 +712,16 @@ export async function reportDelay(tripId, delayMinutes, reason) {
 }
 
 async function flagLateIfNeeded(client, tripId) {
+  // planned_arrive（ETA）已是包含全部累计延误的唯一口径，此处直接与截止时间比较，
+  // 切勿再加 delay_minutes，否则同一段延误被计入两次、提前触发逾期。
   const { rows: late } = await client.query(
     `UPDATE orders SET status='late'
      WHERE id IN (
        SELECT ti.order_id FROM trip_items ti
        JOIN trips t ON t.id = ti.trip_id
        WHERE ti.trip_id = $1
-         AND (COALESCE(t.actual_arrive,
-                      t.planned_arrive + (t.delay_minutes || ' minutes')::interval, now())
-              > (SELECT deadline FROM orders o WHERE o.id = ti.order_id))
+         AND COALESCE(t.actual_arrive, t.planned_arrive, now())
+               > (SELECT deadline FROM orders o WHERE o.id = ti.order_id)
      ) AND status NOT IN ('delivered','cancelled')
      RETURNING id, order_no`, [tripId]);
   return late;
