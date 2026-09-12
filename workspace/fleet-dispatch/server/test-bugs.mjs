@@ -30,10 +30,11 @@ async function bug1PartialSplitDelivery() {
   assert(!!big, `存在超大件订单 ${big?.order_no} (${big?.weight_tons}t)`);
 
   const cands = await j(`/dispatch/candidates/${big.id}`);
-  // 选一台容量最大的车
-  const v = [...cands.vehicles].sort((a, b) => Number(b.capacity_tons) - Number(a.capacity_tons))[0];
-  const d = cands.drivers.find(x => x.license_type === 'A2');
-  assert(!!v && !!d, `选到 ${v?.plate}(${v.capacity_tons}t) + A2 司机 ${d?.name}`);
+  // 手动新建车次必须选真正 available 的车（candidates 还含 assigned 车用于拼车追加）
+  const v = cands.vehicles.filter(x => x.status === 'available')
+    .sort((a, b) => Number(b.capacity_tons) - Number(a.capacity_tons))[0];
+  const d = cands.drivers.find(x => x.status === 'available' && x.license_type === 'A2');
+  assert(!!v && !!d, `选到 ${v?.plate}(${v?.capacity_tons}t) + A2 司机 ${d?.name}`);
 
   const partial = Math.min(Number(v.capacity_tons), Number(big.weight_tons) - 5);
   const r = await j('/dispatch/assign', 'POST', {
@@ -68,8 +69,13 @@ async function bug1PartialSplitDelivery() {
   const remainTripsBefore = (await j('/trips')).length;
   const c2 = await j(`/dispatch/candidates/${big.id}`);
   if (c2.vehicles.length) {
-    const v2 = [...c2.vehicles].sort((a, b) => Number(b.capacity_tons) - Number(a.capacity_tons))[0];
-    const d2 = c2.drivers.find(x => x.license_type === 'A2');
+    // 剩余 12t 必须用容量足够的大车
+    const need = r.remainingTons;
+    const v2 = c2.vehicles.filter(x => x.status === 'available'
+      && Number(x.capacity_tons) >= need - 1e-6)
+      .sort((a, b) => Number(a.capacity_tons) - Number(b.capacity_tons))[0];
+    const needLic = v2?.vehicle_type === 'large' ? 'A2' : 'B1';
+    const d2 = c2.drivers.find(x => x.status === 'available' && x.license_type === needLic);
     if (v2 && d2) {
       const r2 = await j('/dispatch/assign', 'POST', {
         order_id: big.id, vehicle_id: v2.id, driver_id: d2.id, split_tons: null,

@@ -100,14 +100,4 @@ r.post('/orders', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-r.patch('/orders/:id/cancel', async (req, res, next) => {
-  try {
-    const { rows } = await pool.query(
-      `UPDATE orders SET status='cancelled' WHERE id=$1 AND status NOT IN ('delivered','cancelled') RETURNING *`,
-      [req.params.id]);
-    if (!rows.length) return res.status(409).json({ message: '订单已签收或已取消，无法取消' });
-    res.json(rows[0]);
-  } catch (e) { next(e); }
-});
-
 export default r;

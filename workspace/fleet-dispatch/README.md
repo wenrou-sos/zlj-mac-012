@@ -99,6 +99,10 @@ DATABASE_URL=postgres://user:pass@host:5432/fleet_dispatch
 
 ## 异常处理
 
+- **取消订单**：装车中/在途的订单拒绝取消（提示先按发车/签收或异常流程处理）；
+  未开始车次上的运片释放为 `released`，空载车次整趟撤销并释放车辆/司机，
+  仍拼着其他订单的车次只卸下该单运片、继续执行。已取消订单不会被后续车次签收“复活”。
+  已派满运量的订单再次派车会被拒绝（防止 0 吨空车次占用资源）。
 - **撤销派车**：仅 **待装车（planned）** 车次可撤销。撤销后车次保留为 `cancelled`
   审计留痕，运片标记 `released`（不计运量），车辆/司机在**确认无其他活跃车次后**
   才释放为可用/空闲，订单运量退回待调度可重新派车。已装车/在途车次拒绝撤销并给出
@@ -117,6 +121,7 @@ DATABASE_URL=postgres://user:pass@host:5432/fleet_dispatch
 |---|---|---|
 | GET | `/api/dashboard` | 看板统计 |
 | GET/POST | `/api/orders` `/vehicles` `/drivers` | 资源 CRUD |
+| PATCH | `/api/orders/:id/cancel` | 取消订单（释放未开始车次运片、空载整趟撤车，在途拒绝取消） |
 | POST | `/api/dispatch/auto` | 一键智能调度 |
 | POST | `/api/dispatch/assign` | 手动派单（支持 `split_tons` 拆分配车、同路线拼车） |
 | POST | `/api/trips/:id/start-loading` | 开始装车 |

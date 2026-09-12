@@ -3,7 +3,7 @@ import { pool } from '../db/pool.js';
 import {
   autoDispatch, assignOrder, startLoading, reportLoading, departTrip, completeTrip,
   reportBreakdown, repairVehicle, reportDelay, dashboardStats,
-  cancelTrip, cancelBatch, listBatches,
+  cancelTrip, cancelBatch, listBatches, cancelOrder,
 } from '../services/dispatch.js';
 
 const r = Router();
@@ -25,8 +25,7 @@ r.post('/dispatch/assign', async (req, res, next) => {
 });
 
 // 手动派单表单所需的候选资源
-r.get('/dispatch/candidates/:orderId', async (req, res, next) => {
-  try {
+r.get('/dispatch/candidates/:orderId', async (req, res, next) => {  try {
     const { rows: orderRows } = await pool.query(`SELECT * FROM orders WHERE id=$1`, [req.params.orderId]);
     if (!orderRows.length) return res.status(404).json({ message: '订单不存在' });
     const { rows: vehicles } = await pool.query(
@@ -110,6 +109,14 @@ r.post('/batches/:batch/cancel', async (req, res, next) => {
 r.get('/batches', async (req, res, next) => {
   try { res.json(await listBatches()); }
   catch (e) { next(e); }
+});
+
+// 取消订单（连带释放未开始车次的运片与资源；已在执行的订单拒绝取消）
+r.patch('/orders/:id/cancel', async (req, res, next) => {
+  try {
+    const result = await cancelOrder(req.params.id);
+    res.json(result);
+  } catch (e) { next(e); }
 });
 
 // ---------------- 异常 ----------------

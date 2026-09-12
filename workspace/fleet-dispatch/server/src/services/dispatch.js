@@ -107,8 +107,12 @@ export async function autoDispatch() {
   try {
     await client.query('BEGIN');
 
+    // 纳入所有「非终态」订单：包括部分运片已装车/在途/签收（in_transit/late/loading）
+    // 但仍有剩余运量未派的拆分订单——按已派运量计算剩余，只派剩余部分。
     const { rows: orders } = await client.query(
-      `SELECT * FROM orders WHERE status IN ('pending','split') ORDER BY deadline ASC FOR UPDATE`);
+      `SELECT * FROM orders
+       WHERE status NOT IN ('delivered','cancelled')
+       ORDER BY deadline ASC FOR UPDATE`);
     const dbVehicles = await client.query(
       `SELECT * FROM vehicles WHERE status = 'available' ORDER BY capacity_tons ASC FOR UPDATE`);
     const dbDrivers = await client.query(
@@ -320,14 +324,41 @@ export async function autoDispatch() {
     for (const it of items) {
       const chunks = chunkCount.get(it.order.id) || 0;
       const fullyPlaced = it.remainW <= 0.001 && it.remainV <= 0.001;
+
+      // 该订单是否已有运片进入装车/在途/签收阶段；若是，状态只能保持/前进，
+      // 不能因为追加了 planned 运片就降级回 assigned/split。
+      const { rows: ph } = await client.query(
+        `SELECT COALESCE(MAX(CASE
+                  WHEN t.status='completed' THEN 3
+                  WHEN t.status='in_transit' THEN 2
+                  WHEN t.status='loading' THEN 1 ELSE 0 END),0) phase
+         FROM trip_items ti JOIN trips t ON t.id=ti.trip_id
+         WHERE ti.order_id=$1 AND ti.load_status<>'released'
+           AND t.status<>'cancelled'`, [it.order.id]);
+      const phase = Number(ph[0].phase);
+
       if (fullyPlaced) {
-        const split = chunks > 1 || it.order.status === 'split';
-        await client.query(`UPDATE orders SET status=$1 WHERE id=$2`,
-          [split ? 'split' : 'assigned', it.order.id]);
+        // 是否拆分：本次新增 >1 片，或此前已有多片（含已签收片）
+        const { rows: tot } = await client.query(
+          `SELECT COUNT(*)::int c FROM trip_items ti JOIN trips t ON t.id=ti.trip_id
+           WHERE ti.order_id=$1 AND ti.load_status<>'released' AND t.status<>'cancelled'`,
+          [it.order.id]);
+        const split = tot[0].c > 1;
+        let next;
+        if (phase >= 2) next = 'in_transit';
+        else if (phase === 1) next = 'loading';
+        else next = split ? 'split' : 'assigned';
+        await client.query(
+          `UPDATE orders SET status=$1 WHERE id=$2 AND status<>'cancelled'`,
+          [next, it.order.id]);
         if (split) ordersSplit++; else ordersAssigned++;
       } else {
         if (chunks > 0) {
-          await client.query(`UPDATE orders SET status='split' WHERE id=$1`, [it.order.id]);
+          // 本次新派了部分运片：有在途片保持 in_transit，否则 split
+          const next = phase >= 2 ? 'in_transit' : phase === 1 ? 'loading' : 'split';
+          await client.query(
+            `UPDATE orders SET status=$1 WHERE id=$2 AND status NOT IN ('cancelled','in_transit','loading')`,
+            [next, it.order.id]);
           ordersSplit++;
         }
         const compatible = dbVehicles.rows.filter(x => typeMatches(x, it.order));
@@ -392,8 +423,20 @@ export async function assignOrder(orderId, vehicleId, driverId, splitTons = null
        WHERE ti.order_id=$1 AND t.status<>'cancelled' AND ti.load_status<>'released'`, [orderId]);
     const remainW = Number(order.weight_tons) - Number(sum[0].w);
     const remainV = Number(order.volume_m3) - Number(sum[0].v);
+    if (remainW <= 1e-6 && remainV <= 1e-6) {
+      throw Object.assign(
+        new Error(`订单 ${order.order_no} 运量已全部派出（${order.weight_tons}t），没有可再派的剩余运量`),
+        { status: 409, code: 'NOTHING_TO_ASSIGN' });
+    }
+    if (order.status === 'cancelled') {
+      throw Object.assign(new Error('订单已取消，不能派车'), { status: 409 });
+    }
     const chunkW = splitTons ? Math.min(Number(splitTons), remainW) : remainW;
     const chunkV = remainW > 0 ? remainV * (chunkW / remainW) : remainV;
+    if (chunkW <= 1e-6 || chunkV <= 1e-6) {
+      throw Object.assign(new Error('本车运片为 0，无法派车（订单可能已派满）'),
+        { status: 409, code: 'EMPTY_CHUNK' });
+    }
 
     if (chunkW > Number(vehicle.capacity_tons) + 1e-6 || chunkV > Number(vehicle.capacity_volume) + 1e-6) {
       throw Object.assign(new Error('运片超出车辆载重/容积容量'), { status: 409 });
@@ -406,8 +449,10 @@ export async function assignOrder(orderId, vehicleId, driverId, splitTons = null
 
     // 若该车已有同路线的待装 planned 车次，则作为运片追加（拆单拼车）
     const { rows: ex } = await client.query(
-      `SELECT t.*, COALESCE((SELECT SUM(weight_tons) FROM trip_items WHERE trip_id=t.id),0) load_w,
-              COALESCE((SELECT SUM(volume_m3) FROM trip_items WHERE trip_id=t.id),0) load_v
+      `SELECT t.*, COALESCE((SELECT SUM(weight_tons) FROM trip_items
+                  WHERE trip_id=t.id AND load_status<>'released'),0) load_w,
+              COALESCE((SELECT SUM(volume_m3) FROM trip_items
+                  WHERE trip_id=t.id AND load_status<>'released'),0) load_v
        FROM trips t WHERE t.vehicle_id=$1 AND t.status='planned'
          AND t.origin=$2 AND t.destination=$3 LIMIT 1 FOR UPDATE`,
       [vehicleId, order.origin, order.destination]);
@@ -439,17 +484,25 @@ export async function assignOrder(orderId, vehicleId, driverId, splitTons = null
        SET weight_tons = trip_items.weight_tons + EXCLUDED.weight_tons,
            volume_m3 = trip_items.volume_m3 + EXCLUDED.volume_m3`,
       [trip.id, orderId, chunkW, chunkV]);
-    // 重排时间
+    // 重排时间（只统计活跃运片）
     const { rows: nw } = await client.query(
-      `SELECT COALESCE(SUM(weight_tons),0) w FROM trip_items WHERE trip_id=$1`, [trip.id]);
+      `SELECT COALESCE(SUM(weight_tons),0) w FROM trip_items
+       WHERE trip_id=$1 AND load_status<>'released'`, [trip.id]);
     const { depart, arrive: arr2 } = planArrival(now(), Number(nw[0].w), Number(order.distance_km));
     await client.query(`UPDATE trips SET planned_depart=$1, planned_arrive=$2 WHERE id=$3`,
       [depart, arr2, trip.id]);
 
     const remaining = remainW - chunkW;
+    // 不降级已有执行阶段的订单；全部派完按 split/assigned，仍有剩余保持/置为 split
     await client.query(
-      `UPDATE orders SET status = CASE WHEN $1 < 0.01 THEN
-         CASE WHEN status='split' THEN 'split' ELSE 'assigned' END ELSE 'split' END WHERE id=$2`,
+      `UPDATE orders SET status = CASE
+         WHEN status IN ('loading','in_transit','late') THEN status
+         WHEN $1 < 0.01 THEN
+           CASE WHEN (SELECT COUNT(*) FROM trip_items ti JOIN trips t ON t.id=ti.trip_id
+                      WHERE ti.order_id=$2 AND ti.load_status<>'released' AND t.status<>'cancelled') > 1
+                THEN 'split' ELSE 'assigned' END
+         ELSE 'split' END
+       WHERE id=$2 AND status<>'cancelled'`,
       [remaining, orderId]);
 
     await client.query('COMMIT');
@@ -567,25 +620,28 @@ export async function completeTrip(tripId) {
       [+drivenH.toFixed(1), trip.driver_id]);
 
     const { rows: items } = await client.query(
-      `SELECT DISTINCT order_id FROM trip_items WHERE trip_id=$1`, [tripId]);
+      `SELECT DISTINCT order_id FROM trip_items WHERE trip_id=$1 AND load_status<>'released'`,
+      [tripId]);
     for (const { order_id } of items) {
       // 必须按「运量」判定完结：拆分订单可能还有运片尚未派车，
       // 那些运片不在 trip_items 中，按运片数比较会把部分签收误判为整单完成。
       const { rows: oall } = await client.query(
-        `SELECT o.id, o.deadline, o.weight_tons, o.volume_m3,
+        `SELECT o.id, o.status, o.deadline, o.weight_tons, o.volume_m3,
           COALESCE((
             SELECT SUM(ti.weight_tons) FROM trip_items ti JOIN trips t ON t.id=ti.trip_id
-            WHERE ti.order_id=o.id AND t.status='completed'),0) done_w,
+            WHERE ti.order_id=o.id AND t.status='completed' AND ti.load_status<>'released'),0) done_w,
           COALESCE((
             SELECT SUM(ti.volume_m3) FROM trip_items ti JOIN trips t ON t.id=ti.trip_id
-            WHERE ti.order_id=o.id AND t.status='completed'),0) done_v
+            WHERE ti.order_id=o.id AND t.status='completed' AND ti.load_status<>'released'),0) done_v
          FROM orders o WHERE o.id=$1 FOR UPDATE`, [order_id]);
       const o = oall[0];
+      // 已取消的订单绝不能被后续签收“复活”
+      if (o.status === 'cancelled') continue;
       const allDelivered = Number(o.done_w) + 1e-6 >= Number(o.weight_tons)
         && Number(o.done_v) + 1e-6 >= Number(o.volume_m3);
       if (allDelivered) {
         const late = arrival > new Date(o.deadline);
-        await client.query(`UPDATE orders SET status=$1 WHERE id=$2`,
+        await client.query(`UPDATE orders SET status=$1 WHERE id=$2 AND status<>'cancelled'`,
           [late ? 'late' : 'delivered', order_id]);
       }
       // 未全部签收（含尚未派车的剩余运量）：保持流转中状态，不标记完成
@@ -764,6 +820,93 @@ export async function listBatches() {
      FROM trips WHERE dispatch_batch IS NOT NULL
      GROUP BY dispatch_batch ORDER BY MIN(created_at) DESC`);
   return rows;
+}
+
+// ---------------------------------------------------------------------------
+// 取消订单
+// ---------------------------------------------------------------------------
+
+/**
+ * 取消订单的正确语义：
+ * - 若存在装车中/在途运片，订单正在执行，拒绝取消（必须先按异常流程处理）。
+ * - 未开始（planned）车次上的运片：释放为 released；该车次若因此空载，整趟撤销并
+ *   释放车辆/司机（避免出现 0 吨车次继续占资源）；若同车还拼了其他订单，车次保留。
+ * - 已签收的运片不可撤销（货已送达）；若订单已有部分签收，则只能取消剩余运量，
+ *   订单保持终态记录，不再可能被后续签收“复活”。
+ */
+export async function cancelOrder(orderId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: or } = await client.query(
+      `SELECT * FROM orders WHERE id=$1 FOR UPDATE`, [orderId]);
+    const order = or[0];
+    if (!order) throw Object.assign(new Error('订单不存在'), { status: 404 });
+    if (order.status === 'cancelled') {
+      throw Object.assign(new Error(`订单 ${order.order_no} 已取消，请勿重复操作`),
+        { status: 409, code: 'ALREADY_CANCELLED' });
+    }
+    if (order.status === 'delivered') {
+      throw Object.assign(new Error('订单已全部签收，不能取消'), { status: 409 });
+    }
+
+    // 正在执行的运片（装车中/在途）-> 拒绝
+    const { rows: activeRows } = await client.query(
+      `SELECT t.id, t.trip_no, t.status FROM trip_items ti
+       JOIN trips t ON t.id=ti.trip_id
+       WHERE ti.order_id=$1 AND ti.load_status<>'released'
+         AND t.status IN ('loading','in_transit')
+       LIMIT 1`, [orderId]);
+    if (activeRows.length) {
+      throw Object.assign(
+        new Error(`订单在车次 ${activeRows[0].trip_no} 上${TRIP_STATUS_LABEL[activeRows[0].status]}，请先按发车/签收或异常流程处理后再取消`),
+        { status: 409, code: 'ORDER_IN_FLIGHT' });
+    }
+
+    // 找到所有未开始车次上、属于该订单的活跃运片
+    const { rows: plannedItems } = await client.query(
+      `SELECT ti.trip_id, t.trip_no FROM trip_items ti
+       JOIN trips t ON t.id=ti.trip_id
+       WHERE ti.order_id=$1 AND ti.load_status<>'released' AND t.status='planned'
+       FOR UPDATE OF t`, [orderId]);
+
+    const affectedTrips = new Set(plannedItems.map(r => Number(r.trip_id)));
+    for (const tripId of affectedTrips) {
+      // 先释放该订单在这趟车上的运片
+      await client.query(
+        `UPDATE trip_items SET load_status='released'
+         WHERE trip_id=$1 AND order_id=$2 AND load_status<>'released'`,
+        [tripId, orderId]);
+      // 车次是否还有其他订单的活跃运片？
+      const { rows: left } = await client.query(
+        `SELECT COUNT(*) FILTER (WHERE load_status<>'released')::int c,
+                COALESCE(SUM(weight_tons) FILTER (WHERE load_status<>'released'),0) w
+         FROM trip_items WHERE trip_id=$1`, [tripId]);
+      if (Number(left[0].w) <= 1e-6) {
+        // 空载：整趟撤销并释放资源
+        const { rows: trow } = await client.query(
+          `SELECT * FROM trips WHERE id=$1 FOR UPDATE`, [tripId]);
+        await client.query(`UPDATE trips SET status='cancelled' WHERE id=$1`, [tripId]);
+        await releaseVehicleIfFree(client, trow[0].vehicle_id);
+        await releaseDriverIfFree(client, trow[0].driver_id);
+      } else {
+        // 还拼着其他订单：重排 ETA 与装车量，车次继续执行
+        await recalcTripEta(client, tripId);
+      }
+    }
+
+    await client.query(`UPDATE orders SET status='cancelled' WHERE id=$1`, [orderId]);
+
+    // 同车次上其他订单的状态无需变化；已释放运片不再计入任何运量
+    await client.query('COMMIT');
+    return {
+      orderNo: order.order_no,
+      tripsReleased: plannedItems.length,
+      tripsCancelled: plannedItems.length, // 空载撤销数由调用方可再查，此处返回运片数
+    };
+  } catch (e) {
+    await client.query('ROLLBACK'); throw e;
+  } finally { client.release(); }
 }
 
 // ---------------------------------------------------------------------------

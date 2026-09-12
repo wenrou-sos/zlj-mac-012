@@ -68,10 +68,10 @@
       </el-table-column>
       <el-table-column label="操作" width="180" fixed="right">
         <template #default="{ row }">
-          <el-button v-if="['pending','split'].includes(row.status)" link type="primary"
+          <el-button v-if="canAssign(row)" link type="primary"
             @click="openAssign(row)">手动派单</el-button>
           <el-button v-if="!['delivered','cancelled'].includes(row.status)" link type="danger"
-            @click="cancel(row)">取消</el-button>
+            @click="cancel(row)">取消订单</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -194,6 +194,13 @@ const eligibleDrivers = computed(() => {
 
 async function load() { orders.value = await api.getOrders(filter.value || undefined); }
 
+/** 只要订单非终态、且还有运量未派出，就允许手动派单（覆盖部分签收后的剩余运量） */
+function canAssign(row) {
+  if (['delivered', 'cancelled'].includes(row.status)) return false;
+  const remain = Number(row.weight_tons) - Number(row.assigned_tons || 0);
+  return remain > 0.001;
+}
+
 async function auto() {
   const r = await api.autoDispatch();
   ElMessage({
@@ -214,9 +221,15 @@ async function submitCreate() {
 }
 
 async function cancel(row) {
-  await ElMessageBox.confirm(`确认取消订单 ${row.order_no}？`, '提示', { type: 'warning' });
-  await api.cancelOrder(row.id);
-  ElMessage.success('已取消');
+  const remain = Number(row.weight_tons) - Number(row.assigned_tons || 0);
+  await ElMessageBox.confirm(
+    `确认取消订单 ${row.order_no}？\n` +
+    `未开始装车的派车将被撤销（空载车次整趟取消并释放车辆/司机，拼车车次仅卸下该订单运片）；` +
+    (remain > 0.001 ? `剩余 ${remain.toFixed(1)} 吨未派运量将一并作废。\n` : '') +
+    `已在装车/运输途中的车次不能取消，需先按发车/签收或异常流程处理。`,
+    '取消订单', { type: 'warning', confirmButtonText: '确认取消', cancelButtonText: '再想想' });
+  const r = await api.cancelOrder(row.id);
+  ElMessage.success(`订单已取消，释放 ${r.tripsReleased} 个未装车车次运片`);
   await load();
 }
 
