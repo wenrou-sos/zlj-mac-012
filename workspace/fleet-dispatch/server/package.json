@@ -1,0 +1,20 @@
+{
+  "name": "fleet-dispatch-server",
+  "version": "1.0.0",
+  "description": "物流车队调度系统 - API 服务",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "seed": "node src/db/seed.js --force"
+  },
+  "dependencies": {
+    "@embedded-postgres/linux-arm64": "17.10.0-beta.17",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "embedded-postgres": "17.10.0-beta.17",
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  }
+}
